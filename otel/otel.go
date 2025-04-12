@@ -96,12 +96,12 @@ func (o *Otel) initLog(ctx context.Context) (*sdklog.LoggerProvider, error) {
 	return loggerProvider, nil
 }
 
-func (s *Otel) initMetricProvider(ctx context.Context) (*sdkmetric.MeterProvider, error) {
+func (o *Otel) initMetricProvider(ctx context.Context) (*sdkmetric.MeterProvider, error) {
 
 	res, err := resource.New(ctx,
 		resource.WithAttributes(
 			semconv.ServiceName("doctor"),
-			semconv.DeploymentEnvironment(s.environment),
+			semconv.DeploymentEnvironment(o.environment),
 		),
 		resource.WithProcessRuntimeDescription(),
 		resource.WithTelemetrySDK(),
@@ -114,11 +114,11 @@ func (s *Otel) initMetricProvider(ctx context.Context) (*sdkmetric.MeterProvider
 		ctx,
 		otlpmetricgrpc.WithInsecure(),
 		otlpmetricgrpc.WithHeaders(map[string]string{
-			"Authorization": "Basic " + s.otelToken,
+			"Authorization": "Basic " + o.otelToken,
 			"organization":  "default",
 			"stream-name":   "default",
 		}),
-		otlpmetricgrpc.WithEndpoint(s.otelHost),
+		otlpmetricgrpc.WithEndpoint(o.otelHost),
 		otlpmetricgrpc.WithTimeout(5*time.Second),
 		otlpmetricgrpc.WithRetry(otlpmetricgrpc.RetryConfig{
 			Enabled:         true,
@@ -145,12 +145,12 @@ func (s *Otel) initMetricProvider(ctx context.Context) (*sdkmetric.MeterProvider
 	return mp, nil
 }
 
-func (s *Otel) initTraceProvider(ctx context.Context) (*sdktrace.TracerProvider, error) {
+func (o *Otel) initTraceProvider(ctx context.Context) (*sdktrace.TracerProvider, error) {
 
 	res, err := resource.New(ctx,
 		resource.WithAttributes(
 			semconv.ServiceName("doctor"),
-			semconv.DeploymentEnvironment(s.env.Environment),
+			semconv.DeploymentEnvironment(o.environment),
 		),
 		resource.WithProcessRuntimeDescription(),
 		resource.WithTelemetrySDK(),
@@ -163,11 +163,11 @@ func (s *Otel) initTraceProvider(ctx context.Context) (*sdktrace.TracerProvider,
 		ctx,
 		otlptracegrpc.WithInsecure(),
 		otlptracegrpc.WithHeaders(map[string]string{
-			"Authorization": "Basic " + s.otelToken,
+			"Authorization": "Basic " + o.otelToken,
 			"organization":  "default",
 			"stream-name":   "default",
 		}),
-		otlptracegrpc.WithEndpoint(s.env.OtelEndpoint),
+		otlptracegrpc.WithEndpoint(o.otelHost),
 		otlptracegrpc.WithTimeout(5*time.Second),
 		otlptracegrpc.WithRetry(otlptracegrpc.RetryConfig{
 			Enabled:         true,
@@ -191,14 +191,14 @@ func (s *Otel) initTraceProvider(ctx context.Context) (*sdktrace.TracerProvider,
 	return tp, nil
 }
 
-func (s *Otel) Shutdown(ctx context.Context) {
-	if err := s.LP.Shutdown(ctx); err != nil {
+func (o *Otel) Shutdown(ctx context.Context) {
+	if err := o.LP.Shutdown(ctx); err != nil {
 		log.Printf("Error shutting down log provider: %v", err)
 	}
-	if err := s.MP.Shutdown(ctx); err != nil {
+	if err := o.MP.Shutdown(ctx); err != nil {
 		log.Printf("Error shutting down meter provider: %v", err)
 	}
-	if err := s.TP.Shutdown(ctx); err != nil {
+	if err := o.TP.Shutdown(ctx); err != nil {
 		log.Printf("Error shutting down tracer provider: %v", err)
 	}
 }
