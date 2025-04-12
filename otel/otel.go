@@ -18,107 +18,143 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
 )
 
+// Config holds configuration parameters for Otel initialization
+type Config struct {
+	Host         string
+	Token        string
+	ServiceName  string
+	Environment  string
+	Organization string
+	StreamName   string
+}
+
+// Otel encapsulates OpenTelemetry providers
 type Otel struct {
-	otelHost    string
-	otelToken   string
-	environment string
-	serviceName string
-	LP          *sdklog.LoggerProvider
-	MP          *sdkmetric.MeterProvider
-	TP          *sdktrace.TracerProvider
+	config Config
+	logger *sdklog.LoggerProvider
+	meter  *sdkmetric.MeterProvider
+	tracer *sdktrace.TracerProvider
 }
 
-func NewOtel(otelHost, otelToken, serviceName, environment string) *Otel {
+// New creates and initializes a new Otel instance with the provided configuration
+func New(config Config) *Otel {
 	return &Otel{
-		otelHost:    otelHost,
-		otelToken:   otelToken,
-		serviceName: serviceName,
-		environment: environment,
+		config: config,
 	}
 }
 
+// Setup initializes all OpenTelemetry providers
 func (o *Otel) Setup(ctx context.Context) error {
-	lp, err := o.initLog(ctx)
+	// Initialize logger provider
+	logger, err := o.initLoggerProvider(ctx)
 	if err != nil {
 		return err
 	}
-	o.LP = lp
+	o.logger = logger
+	global.SetLoggerProvider(logger)
 
-	mp, err := o.initMetricProvider(ctx)
+	// Initialize meter provider
+	meter, err := o.initMeterProvider(ctx)
 	if err != nil {
 		return err
 	}
-	o.MP = mp
+	o.meter = meter
+	otel.SetMeterProvider(meter)
 
-	tp, err := o.initTraceProvider(ctx)
+	// Initialize tracer provider
+	tracer, err := o.initTracerProvider(ctx)
 	if err != nil {
 		return err
 	}
-	o.TP = tp
+	o.tracer = tracer
+	otel.SetTracerProvider(tracer)
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	))
+
 	return nil
 }
 
-// init the logger and set it to global default
-func (o *Otel) initLog(ctx context.Context) (*sdklog.LoggerProvider, error) {
-
-	exporter, err := otlploggrpc.New(
-		ctx,
-		otlploggrpc.WithEndpoint(o.otelHost),
-		otlploggrpc.WithInsecure(),
-		otlploggrpc.WithHeaders(map[string]string{
-			"Authorization": "Basic " + o.otelToken,
-			"organization":  "default",
-			"stream-name":   "default",
-		}),
-	)
-	if err != nil {
-		return nil, err
+// Shutdown gracefully shuts down all providers
+func (o *Otel) Shutdown(ctx context.Context) {
+	if o.logger != nil {
+		if err := o.logger.Shutdown(ctx); err != nil {
+			log.Printf("Error shutting down logger provider: %v", err)
+		}
 	}
-
-	res, err := resource.New(
-		ctx,
-		resource.WithAttributes(
-			semconv.ServiceName("doctor"),
-		),
-	)
-	if err != nil {
-		return nil, err
+	if o.meter != nil {
+		if err := o.meter.Shutdown(ctx); err != nil {
+			log.Printf("Error shutting down meter provider: %v", err)
+		}
 	}
-
-	loggerProvider := sdklog.NewLoggerProvider(
-		sdklog.WithResource(res),
-		sdklog.WithProcessor(
-			sdklog.NewBatchProcessor(exporter),
-		),
-	)
-
-	global.SetLoggerProvider(loggerProvider)
-	return loggerProvider, nil
+	if o.tracer != nil {
+		if err := o.tracer.Shutdown(ctx); err != nil {
+			log.Printf("Error shutting down tracer provider: %v", err)
+		}
+	}
 }
 
-func (o *Otel) initMetricProvider(ctx context.Context) (*sdkmetric.MeterProvider, error) {
+// commonHeaders returns the common headers for OTLP exporters
+func (o *Otel) commonHeaders() map[string]string {
+	return map[string]string{
+		"Authorization": "Basic " + o.config.Token,
+		"organization":  o.config.Organization,
+		"stream-name":   o.config.StreamName,
+	}
+}
 
-	res, err := resource.New(ctx,
+// commonResource creates a common resource configuration
+func (o *Otel) commonResource(ctx context.Context) (*resource.Resource, error) {
+	return resource.New(ctx,
 		resource.WithAttributes(
-			semconv.ServiceName("doctor"),
-			semconv.DeploymentEnvironment(o.environment),
+			semconv.ServiceName(o.config.ServiceName),
+			semconv.DeploymentEnvironment(o.config.Environment),
 		),
 		resource.WithProcessRuntimeDescription(),
 		resource.WithTelemetrySDK(),
 	)
+}
+
+// initLoggerProvider initializes the logger provider
+func (o *Otel) initLoggerProvider(ctx context.Context) (*sdklog.LoggerProvider, error) {
+	exporter, err := otlploggrpc.New(
+		ctx,
+		otlploggrpc.WithEndpoint(o.config.Host),
+		otlploggrpc.WithInsecure(),
+		otlploggrpc.WithHeaders(o.commonHeaders()),
+	)
 	if err != nil {
 		return nil, err
 	}
 
-	exporterMetric, err := otlpmetricgrpc.New(
+	res, err := resource.New(ctx,
+		resource.WithAttributes(
+			semconv.ServiceName(o.config.ServiceName),
+		),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return sdklog.NewLoggerProvider(
+		sdklog.WithResource(res),
+		sdklog.WithProcessor(sdklog.NewBatchProcessor(exporter)),
+	), nil
+}
+
+// initMeterProvider initializes the meter provider
+func (o *Otel) initMeterProvider(ctx context.Context) (*sdkmetric.MeterProvider, error) {
+	res, err := o.commonResource(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	exporter, err := otlpmetricgrpc.New(
 		ctx,
+		otlpmetricgrpc.WithEndpoint(o.config.Host),
 		otlpmetricgrpc.WithInsecure(),
-		otlpmetricgrpc.WithHeaders(map[string]string{
-			"Authorization": "Basic " + o.otelToken,
-			"organization":  "default",
-			"stream-name":   "default",
-		}),
-		otlpmetricgrpc.WithEndpoint(o.otelHost),
+		otlpmetricgrpc.WithHeaders(o.commonHeaders()),
 		otlpmetricgrpc.WithTimeout(5*time.Second),
 		otlpmetricgrpc.WithRetry(otlpmetricgrpc.RetryConfig{
 			Enabled:         true,
@@ -131,43 +167,30 @@ func (o *Otel) initMetricProvider(ctx context.Context) (*sdkmetric.MeterProvider
 		return nil, err
 	}
 
-	metricReader := sdkmetric.NewPeriodicReader(
-		exporterMetric,
+	reader := sdkmetric.NewPeriodicReader(
+		exporter,
 		sdkmetric.WithInterval(10*time.Second),
 		sdkmetric.WithTimeout(5*time.Second),
 	)
-	mp := sdkmetric.NewMeterProvider(
-		sdkmetric.WithResource(res),
-		sdkmetric.WithReader(metricReader),
-	)
 
-	otel.SetMeterProvider(mp)
-	return mp, nil
+	return sdkmetric.NewMeterProvider(
+		sdkmetric.WithResource(res),
+		sdkmetric.WithReader(reader),
+	), nil
 }
 
-func (o *Otel) initTraceProvider(ctx context.Context) (*sdktrace.TracerProvider, error) {
-
-	res, err := resource.New(ctx,
-		resource.WithAttributes(
-			semconv.ServiceName("doctor"),
-			semconv.DeploymentEnvironment(o.environment),
-		),
-		resource.WithProcessRuntimeDescription(),
-		resource.WithTelemetrySDK(),
-	)
+// initTracerProvider initializes the tracer provider
+func (o *Otel) initTracerProvider(ctx context.Context) (*sdktrace.TracerProvider, error) {
+	res, err := o.commonResource(ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	exporter, err := otlptracegrpc.New(
 		ctx,
+		otlptracegrpc.WithEndpoint(o.config.Host),
 		otlptracegrpc.WithInsecure(),
-		otlptracegrpc.WithHeaders(map[string]string{
-			"Authorization": "Basic " + o.otelToken,
-			"organization":  "default",
-			"stream-name":   "default",
-		}),
-		otlptracegrpc.WithEndpoint(o.otelHost),
+		otlptracegrpc.WithHeaders(o.commonHeaders()),
 		otlptracegrpc.WithTimeout(5*time.Second),
 		otlptracegrpc.WithRetry(otlptracegrpc.RetryConfig{
 			Enabled:         true,
@@ -180,25 +203,8 @@ func (o *Otel) initTraceProvider(ctx context.Context) (*sdktrace.TracerProvider,
 		return nil, err
 	}
 
-	tp := sdktrace.NewTracerProvider(
+	return sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(exporter),
 		sdktrace.WithResource(res),
-	)
-
-	otel.SetTracerProvider(tp)
-	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
-
-	return tp, nil
-}
-
-func (o *Otel) Shutdown(ctx context.Context) {
-	if err := o.LP.Shutdown(ctx); err != nil {
-		log.Printf("Error shutting down log provider: %v", err)
-	}
-	if err := o.MP.Shutdown(ctx); err != nil {
-		log.Printf("Error shutting down meter provider: %v", err)
-	}
-	if err := o.TP.Shutdown(ctx); err != nil {
-		log.Printf("Error shutting down tracer provider: %v", err)
-	}
+	), nil
 }
