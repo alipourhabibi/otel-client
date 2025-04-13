@@ -2,7 +2,7 @@ package otel
 
 import (
 	"context"
-	"log"
+	"errors"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -26,6 +26,7 @@ type Config struct {
 	Environment  string
 	Organization string
 	StreamName   string
+	SampleRate   float64 // Sampling rate for traces (0 to 1; 0 disables sampling)
 }
 
 // Otel encapsulates OpenTelemetry providers
@@ -77,22 +78,24 @@ func (o *Otel) Setup(ctx context.Context) error {
 }
 
 // Shutdown gracefully shuts down all providers
-func (o *Otel) Shutdown(ctx context.Context) {
+func (o *Otel) Shutdown(ctx context.Context) error {
+	var errs []error
 	if o.logger != nil {
 		if err := o.logger.Shutdown(ctx); err != nil {
-			log.Printf("Error shutting down logger provider: %v", err)
+			errs = append(errs, err)
 		}
 	}
 	if o.meter != nil {
 		if err := o.meter.Shutdown(ctx); err != nil {
-			log.Printf("Error shutting down meter provider: %v", err)
+			errs = append(errs, err)
 		}
 	}
 	if o.tracer != nil {
 		if err := o.tracer.Shutdown(ctx); err != nil {
-			log.Printf("Error shutting down tracer provider: %v", err)
+			errs = append(errs, err)
 		}
 	}
+	return errors.Join(errs...)
 }
 
 // commonHeaders returns the common headers for OTLP exporters
@@ -128,11 +131,7 @@ func (o *Otel) initLoggerProvider(ctx context.Context) (*sdklog.LoggerProvider, 
 		return nil, err
 	}
 
-	res, err := resource.New(ctx,
-		resource.WithAttributes(
-			semconv.ServiceName(o.config.ServiceName),
-		),
-	)
+	res, err := o.commonResource(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -203,8 +202,14 @@ func (o *Otel) initTracerProvider(ctx context.Context) (*sdktrace.TracerProvider
 		return nil, err
 	}
 
+	sampler := sdktrace.AlwaysSample()
+	if o.config.SampleRate > 0 {
+		sampler = sdktrace.ParentBased(sdktrace.TraceIDRatioBased(o.config.SampleRate))
+	}
+
 	return sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(exporter),
 		sdktrace.WithResource(res),
+		sdktrace.WithSampler(sampler),
 	), nil
 }

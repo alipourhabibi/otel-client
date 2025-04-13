@@ -27,7 +27,6 @@ func (h *otelHandler) Enabled(_ context.Context, level slog.Level) bool {
 }
 
 func (h *otelHandler) Handle(ctx context.Context, r slog.Record) error {
-
 	severity := log.SeverityInfo
 	switch r.Level {
 	case slog.LevelDebug:
