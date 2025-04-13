@@ -98,6 +98,16 @@ func (o *Otel) Shutdown(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
+// GetTracerProvider returns the tracer provider
+func (o *Otel) GetTracerProvider() *sdktrace.TracerProvider {
+	return o.tracer
+}
+
+// GetMeterProvider returns the meter provider
+func (o *Otel) GetMeterProvider() *sdkmetric.MeterProvider {
+	return o.meter
+}
+
 // commonHeaders returns the common headers for OTLP exporters
 func (o *Otel) commonHeaders() map[string]string {
 	return map[string]string{
