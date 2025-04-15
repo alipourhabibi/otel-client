@@ -1,12 +1,13 @@
-# OpenTelemetry Client Example for OpenObserver
+# OpenTelemetry Client Example for OpenObserve
 
-This example demonstrates how to use the `otel-client` package to integrate OpenTelemetry with a simple HTTP server in Go. The server exposes a `/hello` endpoint, logs requests using `slog`, records metrics (accepted/failed requests and latency), and traces operations, all sent to an OpenObserver instance.
+This example demonstrates how to use the `otel-client` package to integrate OpenTelemetry with a simple HTTP server in Go. The server exposes a `/hello` endpoint, logs requests using `slog`, records metrics (accepted/failed requests and latency), and traces operations, all sent to an OpenObserve instance.
 
 ## Prerequisites
 
 - **Go**: Version 1.21 or later.
-- **OpenObserver**: Access to an OpenObserver instance with a valid endpoint and token.
+- **OpenObserve**: Running locally on `http://localhost:5081` with OTLP endpoint at `localhost:5081` (or your custom endpoint).
 - **curl**: For testing the HTTP endpoint.
+- **Docker**: If running OpenObserve in a container.
 
 ## Project Structure
 
@@ -30,46 +31,55 @@ This example demonstrates how to use the `otel-client` package to integrate Open
 
 ## Setup
 
-1. **Clone the Repository** (if applicable):
+1. **Navigate to the Project Directory**:
 
-   If this is part of a repository, clone it:
+   If you’ve cloned a repository:
 
    ```bash
    git clone <repository-url>
    cd otel-client
    ```
 
-If you're working locally, navigate to the project directory:
+   Or, if working locally:
 
    ```bash
    cd ~/Documents/otel-client
    ```
 
-2. **Update OpenObserver Configuration**:
+2. **Verify OpenObserve**:
 
-   Open `examples/example.go` and update the `otel.Config` with your OpenObserver details:
+   Ensure OpenObserve is running:
+
+   ```bash
+   docker ps
+   ```
+
+   Confirm it’s accessible at `http://localhost:5081`. If using a custom setup, verify the OTLP endpoint (default: `localhost:4317`, but configured as `localhost:5081` in this example).
+
+3. **Update OpenObserve Configuration**:
+
+   Open `examples/example.go` and verify the `otel.Config`:
 
    ```go
    config := otel.Config{
-       Host:         "your-openobserver-endpoint:4317", // e.g., "api.openobserver.com:4317"
-       Token:        "your-openobserver-token",
+       Host:         "localhost:5081",
+       Token:        "cm9vdEBleGFtcGxlLmNvbTpDb21wbGV4cGFzcyMxMjM=",
        ServiceName:  "example-service",
        Environment:  "development",
-       Organization: "your-organization",
+       Organization: "example-org",
        StreamName:   "example-stream",
-       SampleRate:   1.0, // Sample all traces
+       SampleRate:   1.0,
    }
    ```
 
-   Replace:
-    - `your-openobserver-endpoint:4317` with the actual OpenObserver gRPC endpoint.
-    - `your-openobserver-token` with your authentication token.
-    - `your-organization` with your OpenObserver organization ID.
-    - `example-stream` with your desired stream name.
+   - `Host`: Set to `localhost:5081` for local OpenObserve OTLP ingestion.
+   - `Token`: Base64-encoded `root@example.com:Complexpass#123`.
+   - `Organization` and `StreamName`: Match your OpenObserve setup.
+   - `SampleRate`: 1.0 to capture all traces.
 
-3. **Install Dependencies**:
+   Update these if using a different endpoint or credentials.
 
-   Ensure all dependencies are resolved:
+4. **Install Dependencies**:
 
    ```bash
    go mod tidy
@@ -77,27 +87,28 @@ If you're working locally, navigate to the project directory:
 
 ## Running the Example
 
-Run the example server:
+Start the server:
 
 ```bash
 go run examples/example.go
 ```
 
-The server starts on `http://localhost:8080` and logs:
+The server runs on `http://localhost:8080` and logs:
 
 ```
-{"time":"2025-04-15T12:00:00Z","level":"INFO","msg":"Starting HTTP server on :8080"}
+{"time":"2025-04-15T12:00:00Z","level":"INFO","msg":"Test log from main","app":"example-service"}
+{"time":"2025-04-15T12:00:02Z","level":"INFO","msg":"Starting HTTP server on :8080"}
 ```
 
-The server will:
-- Handle requests at `/hello`.
-- Log requests and responses with trace context.
+It will:
+- Serve `/hello` requests.
+- Log requests and outcomes with trace context.
 - Record metrics (accepted/failed requests, latency).
-- Send traces, metrics, and logs to OpenObserver.
+- Send traces, metrics, and logs to OpenObserve.
 
 ## Testing with curl
 
-Use `curl` to test the `/hello` endpoint. The server simulates a 10% failure rate to demonstrate error handling.
+Test the `/hello` endpoint, which has a ~1% failure rate to simulate errors.
 
 1. **Successful Request**:
 
@@ -105,66 +116,66 @@ Use `curl` to test the `/hello` endpoint. The server simulates a 10% failure rat
    curl http://localhost:8080/hello
    ```
 
-   **Expected Output**:
+   **Output**:
 
    ```
    Hello, World!
    ```
 
-   **Server Logs** (example):
+   **Logs**:
 
    ```
    {"time":"2025-04-15T12:01:00Z","level":"INFO","msg":"Processing request","method":"GET","path":"/hello","trace_id":"abc123","span_id":"def456"}
    {"time":"2025-04-15T12:01:00Z","level":"INFO","msg":"Request completed successfully","trace_id":"abc123","span_id":"def456"}
    ```
 
-   This indicates a successful request, with metrics recorded for latency and accepted requests, and traces sent to OpenObserver.
-
-2. **Failed Request** (may require multiple attempts due to 10% failure rate):
+2. **Failed Request** (rare, ~1% chance):
 
    ```bash
    curl http://localhost:8080/hello
    ```
 
-   **Expected Output** (on failure):
+   **Output** (on failure):
 
    ```
    Internal Server Error
    ```
 
-   **Server Logs** (example):
+   **Logs**:
 
    ```
    {"time":"2025-04-15T12:02:00Z","level":"INFO","msg":"Processing request","method":"GET","path":"/hello","trace_id":"ghi789","span_id":"jkl012"}
    {"time":"2025-04-15T12:02:00Z","level":"ERROR","msg":"Request failed","error":"simulated request failure","trace_id":"ghi789","span_id":"jkl012"}
    ```
 
-   This indicates a failed request, with metrics recorded for failed requests and an error trace sent to OpenObserver.
-
-3. **Multiple Requests to Observe Metrics**:
-
-   Run multiple requests to generate varied metrics:
+3. **Multiple Requests**:
 
    ```bash
-   for i in {1..10}; do curl http://localhost:8080/hello; done
+   for i in {1..10}; do curl -s http://localhost:8080/hello; echo; done
    ```
 
-   This sends 10 requests, some of which may fail, allowing you to observe both success and failure metrics in OpenObserver.
+   Generates metrics and logs for analysis in OpenObserve.
 
-## Verifying in OpenObserver
+## Verifying in OpenObserve
 
-Log in to your OpenObserver dashboard to verify:
+Access OpenObserve at `http://localhost:5081`:
 
-- **Traces**: Look for spans named `handleHello` under `example-service`. Check for success (`OK`) or error statuses.
+- **Logs**:
+   - Go to Logs > Streams > `example-org` > `example-stream`.
+   - Query `match_all('*')` or `match_all('Test log')` for “Last 5 minutes”.
+   - Expect: `Test log from main`, `Processing request`, `Request completed successfully`, occasional `Request failed`.
+   - Verify fields: `_timestamp`, `message`, `severity`, `trace_id`, `span_id`, `app`.
+- **Traces**:
+   - Check for `handleHello` spans under `example-service`.
+   - Look for `OK` or error statuses with `trace_id` correlating to logs.
 - **Metrics**:
-    - `example_service_module_requests_accepted_total`: Count of successful requests.
-    - `example_service_module_requests_failed_total`: Count of failed requests.
-    - `example_service_module_request_duration_seconds`: Latency histogram.
-- **Logs**: Search for logs with `Processing request` or `Request failed`, including `trace_id` and `span_id` for correlation.
+   - `example_service_module_requests_accepted_total`: Successful requests.
+   - `example_service_module_requests_failed_total`: Failed requests.
+   - `example_service_module_request_duration_seconds`: Latency histogram.
 
 ## Stopping the Server
 
-Press `Ctrl+C` to stop the server. The server will shut down gracefully:
+Press `Ctrl+C`. The server shuts down gracefully:
 
 ```
 {"time":"2025-04-15T12:05:00Z","level":"INFO","msg":"Shutting down server..."}
@@ -173,13 +184,44 @@ Press `Ctrl+C` to stop the server. The server will shut down gracefully:
 
 ## Troubleshooting
 
-- **Connection Errors**: Ensure the `Host` and `Token` in `otel.Config` are correct and that your OpenObserver instance is accessible.
-- **No Logs/Metrics/Traces**: Verify the `Organization` and `StreamName` match your OpenObserver setup. Check network connectivity to the endpoint.
-- **Dependency Issues**: Run `go mod tidy` and ensure you're using a compatible Go version.
+- **No Logs in OpenObserve**:
+   - Verify `localhost:5081` accepts OTLP (try `nc -zv localhost 5081` or test with `4317`).
+   - Check OpenObserve logs:
+     ```bash
+     docker logs <openobserve-container-id>
+     ```
+   - Send a direct log:
+     ```bash
+     curl -u "root@example.com:Complexpass#123" -X POST \
+     http://localhost:5081/api/example-org/example-stream/_json \
+     -d '{"message":"direct test","app":"example-service"}'
+     ```
+   - Enable OTLP debug:
+     ```bash
+     export OTEL_LOG_LEVEL=debug
+     go run examples/example.go
+     ```
+- **Delayed Logs**:
+   - Check `_timestamp` in OpenObserve matches current time.
+   - Restart OpenObserve:
+     ```bash
+     docker restart <openobserve-container-id>
+     ```
+- **Connection Errors**:
+   - Confirm `Token`, `Organization`, and `StreamName`.
+   - Test OTLP endpoint:
+     ```bash
+     curl http://localhost:5081
+     ```
+- **Dependency Issues**:
+   - Run `go mod tidy`.
+   - Use Go 1.21+.
 
 ## Notes
 
-- The example uses `slog` for structured logging, integrated with OpenTelemetry via a custom handler.
-- Metrics and traces include attributes like `endpoint="/hello"` for filtering in OpenObserver.
-- The failure rate (10%) is simulated for demonstration; adjust in `example.go` if needed.
+- Structured logging uses `slog` with a custom OpenTelemetry handler (`otel/slog.go`).
+- Failure rate is ~1% for demonstration; adjust in `example.go` (`time.Now().UnixNano()%99`).
+- Metrics include `endpoint="/hello"` for filtering.
+- If logs don’t appear, verify OpenObserve’s OTLP port (e.g., `4317`) and update `Host` in `example.go`.
 
+---
