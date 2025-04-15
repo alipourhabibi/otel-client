@@ -22,10 +22,10 @@ func main() {
 	config := otel.Config{
 		Host:         "localhost:5081",
 		Token:        "cm9vdEBleGFtcGxlLmNvbTpDb21wbGV4cGFzcyMxMjM=",
-		ServiceName:  "example-service",
+		ServiceName:  "example-service3",
 		Environment:  "development",
-		Organization: "example-org",
-		StreamName:   "example-stream",
+		Organization: "example-org3",
+		StreamName:   "example-stream3",
 		SampleRate:   1.0,
 	}
 
