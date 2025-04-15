@@ -111,7 +111,7 @@ func handleHello(otelClient *otel.Otel, metrics *otel.MetricsRecorder) http.Hand
 		time.Sleep(100 * time.Millisecond)
 
 		// Randomly fail 10% of the time
-		if time.Now().UnixNano()%10 == 0 {
+		if time.Now().UnixNano()%99 == 0 {
 			err := errors.New("simulated request failure")
 			slog.ErrorContext(ctx, "Request failed", "error", err)
 			otel.RecordTraceError(err, "example-service", span)
