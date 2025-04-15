@@ -148,7 +148,12 @@ func (o *Otel) initLoggerProvider(ctx context.Context) (*sdklog.LoggerProvider, 
 
 	return sdklog.NewLoggerProvider(
 		sdklog.WithResource(res),
-		sdklog.WithProcessor(sdklog.NewBatchProcessor(exporter)),
+		sdklog.WithProcessor(sdklog.NewBatchProcessor(
+			exporter,
+			sdklog.WithExportInterval(1*time.Second),
+			sdklog.WithExportTimeout(5*time.Second),
+			sdklog.WithMaxQueueSize(2048),
+		)),
 	), nil
 }
 

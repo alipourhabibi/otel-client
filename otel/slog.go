@@ -15,9 +15,9 @@ type otelHandler struct {
 	logger     *slog.Logger
 }
 
-func NewOtelHandler(l *slog.Logger) slog.Handler {
+func NewOtelHandler(l *slog.Logger, serviceName string) slog.Handler {
 	return &otelHandler{
-		otelLogger: global.GetLoggerProvider().Logger("doctor"),
+		otelLogger: global.GetLoggerProvider().Logger(serviceName),
 		logger:     l,
 	}
 }
@@ -60,12 +60,13 @@ func (h *otelHandler) Handle(ctx context.Context, r slog.Record) error {
 	logRecord.SetObservedTimestamp(time.Now())
 	logRecord.SetBody(log.StringValue(r.Message))
 	logRecord.AddAttributes(attrs...)
+	logRecord.AddAttributes(log.Int64("_timestamp", r.Time.UnixMilli()))
 	logRecord.SetSeverityText(severity.String())
 
-	// send to otel
+	// Send to OpenTelemetry
 	h.otelLogger.Emit(ctx, logRecord)
 
-	// our own logger
+	// Log to underlying slog.Logger
 	h.logger.Log(ctx, r.Level, r.Message, logAttrs...)
 
 	return nil

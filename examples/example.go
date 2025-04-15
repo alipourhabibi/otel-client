@@ -3,13 +3,13 @@ package main
 import (
 	"context"
 	"errors"
-	"github.com/Dadegostar/otel-client/otel"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"time"
 
+	"github.com/Dadegostar/otel-client/otel"
 	"go.opentelemetry.io/otel/attribute"
 )
 
@@ -20,13 +20,13 @@ func main() {
 
 	// Configure OpenTelemetry
 	config := otel.Config{
-		Host:         "localhost:5081",                               // Replace with actual endpoint
-		Token:        "cm9vdEBleGFtcGxlLmNvbTpDb21wbGV4cGFzcyMxMjM=", // Replace with actual token
+		Host:         "localhost:5081",
+		Token:        "cm9vdEBleGFtcGxlLmNvbTpDb21wbGV4cGFzcyMxMjM=",
 		ServiceName:  "example-service",
 		Environment:  "development",
 		Organization: "example-org",
 		StreamName:   "example-stream",
-		SampleRate:   1.0, // Sample all traces
+		SampleRate:   1.0,
 	}
 
 	// Initialize OpenTelemetry
@@ -42,10 +42,16 @@ func main() {
 	}()
 
 	// Set up slog with OpenTelemetry handler
-	jsonHandler := slog.NewJSONHandler(os.Stdout, nil)
+	jsonHandler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug})
 	logger := slog.New(jsonHandler)
-	otelLogger := slog.New(otel.NewOtelHandler(logger))
+	otelLogger := slog.New(otel.NewOtelHandler(logger, config.ServiceName))
 	slog.SetDefault(otelLogger)
+
+	// Test log to verify ingestion
+	slog.InfoContext(ctx, "Test log from main", "app", "example-service")
+
+	// Brief delay to allow batch processor to flush
+	time.Sleep(2 * time.Second)
 
 	// Initialize metrics recorder
 	metrics, err := otel.NewMetricsRecorder(otelClient.GetMeterProvider(), "example-service")
@@ -66,7 +72,7 @@ func main() {
 
 	go func() {
 		slog.Info("Starting HTTP server on :8080")
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("Server failed", "error", err)
 			os.Exit(1)
 		}
