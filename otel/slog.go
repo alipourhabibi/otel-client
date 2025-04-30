@@ -3,6 +3,8 @@ package otel
 import (
 	"context"
 	"log/slog"
+	"runtime"
+	"strconv"
 	"time"
 
 	"go.opentelemetry.io/otel/log"
@@ -39,6 +41,14 @@ func (h *otelHandler) Handle(ctx context.Context, r slog.Record) error {
 
 	attrs := make([]log.KeyValue, 0, r.NumAttrs())
 	logAttrs := make([]any, 0, r.NumAttrs())
+
+	pc, file, line, ok := runtime.Caller(3)
+	if ok {
+		runtime.FuncForPC(pc)
+		source := file + ":" + strconv.Itoa(line)
+		logAttrs = append(logAttrs, "source", source)
+	}
+
 	r.Attrs(func(a slog.Attr) bool {
 		attrs = append(attrs, log.String(a.Key, a.Value.String()))
 		logAttrs = append(logAttrs, a.Key)
