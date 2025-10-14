@@ -9,7 +9,7 @@ import (
 	"os/signal"
 	"time"
 
-	"github.com/Dadegostar/otel-client/otel"
+	"github.com/alipourhabibi/otel-client/otel"
 	"go.opentelemetry.io/otel/attribute"
 )
 

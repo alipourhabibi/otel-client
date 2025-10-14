@@ -1,4 +1,4 @@
-module github.com/Dadegostar/otel-client
+module github.com/alipourhabibi/otel-client
 
 go 1.24.0
 
