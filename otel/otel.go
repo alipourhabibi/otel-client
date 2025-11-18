@@ -111,7 +111,7 @@ func (o *Otel) GetMeterProvider() *sdkmetric.MeterProvider {
 // commonHeaders returns the common headers for OTLP exporters
 func (o *Otel) commonHeaders() map[string]string {
 	return map[string]string{
-		"Authorization": "Basic " + o.config.Token,
+		"Authorization": o.config.Token,
 		"organization":  o.config.Organization,
 		"stream-name":   o.config.StreamName,
 	}
