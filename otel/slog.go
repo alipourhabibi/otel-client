@@ -12,133 +12,111 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-func NewLogHandler(name string) slog.Handler {
-	return &Handler{
-		logger: global.GetLoggerProvider().Logger(name),
+// NewSlogHandler wraps an existing slog.Handler and fans every log record out to:
+//   - the OTLP log pipeline (for export to your observability backend), and
+//   - the wrapped handler as-is (for terminal / file output).
+//
+// Trace and span IDs are automatically injected whenever the context carries
+// an active span, giving you log-to-trace correlation for free.
+//
+//	slog.SetDefault(slog.New(otel.NewSlogHandler(base, "github.com/yourorg/svc")))
+func NewSlogHandler(wrapped slog.Handler, name string) slog.Handler {
+	return &slogHandler{
+		otelLogger: global.GetLoggerProvider().Logger(name),
+		wrapped:    wrapped,
 	}
 }
 
-type Handler struct {
-	logger log.Logger
-	attrs  []slog.Attr
-	group  string
+type slogHandler struct {
+	otelLogger log.Logger
+	wrapped    slog.Handler
+	attrs      []slog.Attr
+	group      string
 }
 
-func (h *Handler) Enabled(ctx context.Context, level slog.Level) bool {
-	return h.logger.Enabled(ctx, log.EnabledParameters{
+// Enabled delegates to the OTEL logger's own level check.
+func (h *slogHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return h.otelLogger.Enabled(ctx, log.EnabledParameters{
 		Severity: slogToOtelSeverity(level),
 	})
 }
 
-func (h *Handler) Handle(ctx context.Context, r slog.Record) error {
-	attrCap := len(h.attrs) + r.NumAttrs() + 3
-
-	attrs := make([]log.KeyValue, 0, attrCap)
+func (h *slogHandler) Handle(ctx context.Context, r slog.Record) error {
+	cap := len(h.attrs) + r.NumAttrs() + 4 // +4: group, trace_id, span_id, source
+	otelAttrs := make([]log.KeyValue, 0, cap)
+	slogAttrs := make([]any, 0, cap*2)
 
 	appendAttr := func(k string, v slog.Value) {
-		switch v.Kind() {
-
-		case slog.KindString:
-			attrs = append(attrs, log.String(k, v.String()))
-
-		case slog.KindInt64:
-			attrs = append(attrs, log.Int64(k, v.Int64()))
-
-		case slog.KindFloat64:
-			attrs = append(attrs, log.Float64(k, v.Float64()))
-
-		case slog.KindBool:
-			attrs = append(attrs, log.Bool(k, v.Bool()))
-
-		case slog.KindDuration:
-			attrs = append(attrs, log.Int64(k, int64(v.Duration())))
-
-		case slog.KindTime:
-			attrs = append(attrs, log.String(k, v.Time().Format(time.RFC3339Nano)))
-
-		default:
-			attrs = append(attrs, log.String(k, v.String()))
-		}
+		otelAttrs = append(otelAttrs, log.String(k, v.String()))
+		slogAttrs = append(slogAttrs, k, v.Any())
 	}
 
 	for _, a := range h.attrs {
 		appendAttr(a.Key, a.Value)
 	}
-
 	r.Attrs(func(a slog.Attr) bool {
 		appendAttr(a.Key, a.Value)
 		return true
 	})
-
 	if h.group != "" {
-		attrs = append(attrs, log.String("group", h.group))
+		appendAttr("group", slog.StringValue(h.group))
 	}
 
 	if span := trace.SpanFromContext(ctx); span.IsRecording() {
 		sc := span.SpanContext()
-
-		attrs = append(attrs,
-			log.String("trace_id", sc.TraceID().String()),
-			log.String("span_id", sc.SpanID().String()),
-		)
+		appendAttr("trace_id", slog.StringValue(sc.TraceID().String()))
+		appendAttr("span_id", slog.StringValue(sc.SpanID().String()))
 	}
 
 	if r.PC != 0 {
 		frames := runtime.CallersFrames([]uintptr{r.PC})
 		f, _ := frames.Next()
-
-		attrs = append(attrs,
-			log.String("source", f.File+":"+strconv.Itoa(f.Line)),
-		)
+		appendAttr("source", slog.StringValue(f.File+":"+strconv.Itoa(f.Line)))
 	}
-
-	var rec log.Record
 
 	severity := slogToOtelSeverity(r.Level)
+	var otelRecord log.Record
+	otelRecord.SetSeverity(severity)
+	otelRecord.SetSeverityText(severity.String())
+	otelRecord.SetTimestamp(r.Time)
+	otelRecord.SetObservedTimestamp(time.Now())
+	otelRecord.SetBody(log.StringValue(r.Message))
+	otelRecord.AddAttributes(otelAttrs...)
+	h.otelLogger.Emit(ctx, otelRecord)
 
-	rec.SetSeverity(severity)
-	rec.SetSeverityText(severity.String())
-	rec.SetTimestamp(r.Time)
-	rec.SetObservedTimestamp(time.Now())
-	rec.SetBody(log.StringValue(r.Message))
-
-	rec.AddAttributes(attrs...)
-
-	h.logger.Emit(ctx, rec)
-
-	return nil
+	return h.wrapped.Handle(ctx, r.Clone())
 }
 
-func (h *Handler) WithAttrs(attrs []slog.Attr) slog.Handler {
+func (h *slogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	merged := make([]slog.Attr, len(h.attrs)+len(attrs))
-
 	copy(merged, h.attrs)
 	copy(merged[len(h.attrs):], attrs)
-
-	return &Handler{
-		logger: h.logger,
-		attrs:  merged,
-		group:  h.group,
+	return &slogHandler{
+		otelLogger: h.otelLogger,
+		wrapped:    h.wrapped.WithAttrs(attrs),
+		attrs:      merged,
+		group:      h.group,
 	}
 }
 
-func (h *Handler) WithGroup(name string) slog.Handler {
-	return &Handler{
-		logger: h.logger,
-		attrs:  h.attrs,
-		group:  name,
+func (h *slogHandler) WithGroup(name string) slog.Handler {
+	return &slogHandler{
+		otelLogger: h.otelLogger,
+		wrapped:    h.wrapped.WithGroup(name),
+		attrs:      h.attrs,
+		group:      name,
 	}
 }
 
 func slogToOtelSeverity(l slog.Level) log.Severity {
-	switch {
-	case l <= slog.LevelDebug:
+	switch l {
+	case slog.LevelDebug:
 		return log.SeverityDebug
-	case l < slog.LevelWarn:
-		return log.SeverityInfo
-	case l < slog.LevelError:
+	case slog.LevelWarn:
 		return log.SeverityWarn
-	default:
+	case slog.LevelError:
 		return log.SeverityError
+	default:
+		return log.SeverityInfo
 	}
 }

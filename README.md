@@ -1,6 +1,6 @@
 # otel-client
 
-Minimal OpenTelemetry bootstrap for Go — one import, consistent traces, metrics, and logs over OTLP/gRPC across all your services.
+Minimal OpenTelemetry bootstrap for Go -one import, consistent traces, metrics, and logs over OTLP/gRPC across all your services.
 
 ## Installation
 

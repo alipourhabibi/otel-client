@@ -120,7 +120,7 @@ func (c *Client) Setup(ctx context.Context) error {
 }
 
 // Shutdown flushes all in-flight data and closes every provider.
-// Use a fresh context with a generous timeout (≥10 s) — do NOT reuse the
+// Use a fresh context with a generous timeout (≥10 s) -do NOT reuse the
 // signal context, which is already cancelled by the time shutdown runs.
 func (c *Client) Shutdown(ctx context.Context) error {
 	var errs []error
