@@ -11,121 +11,139 @@ import (
 
 	"github.com/alipourhabibi/otel-client/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
 func main() {
-	// Initialize context for graceful shutdown
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	// Configure OpenTelemetry
-	config := otel.Config{
-		Host:         "localhost:5081",
-		Token:        "cm9vdEBleGFtcGxlLmNvbTpDb21wbGV4cGFzcyMxMjM=",
-		ServiceName:  "example-service3",
-		Environment:  "development",
-		Organization: "example-org3",
-		StreamName:   "example-stream3",
+	cfg := otel.Config{
+		Host:         getEnv("OTEL_HOST", "localhost:4317"),
+		Token:        getEnv("OTEL_TOKEN", ""),
+		ServiceName:  getEnv("OTEL_SERVICE_NAME", "example-service"),
+		Environment:  getEnv("OTEL_ENVIRONMENT", "development"),
+		Organization: getEnv("OTEL_ORGANIZATION", ""),
+		StreamName:   getEnv("OTEL_STREAM_NAME", ""),
 		SampleRate:   1.0,
 	}
 
-	// Initialize OpenTelemetry
-	otelClient := otel.New(config)
-	if err := otelClient.Setup(ctx); err != nil {
-		slog.Error("Failed to setup OpenTelemetry", "error", err)
+	client := otel.New(cfg)
+	if err := client.Setup(ctx); err != nil {
+		slog.Error("otel setup failed", "error", err)
 		os.Exit(1)
 	}
 	defer func() {
-		if err := otelClient.Shutdown(ctx); err != nil {
-			slog.Error("Failed to shutdown OpenTelemetry", "error", err)
+		// Fresh context: the signal context is already cancelled here.
+		sdCtx, sdCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer sdCancel()
+		if err := client.Shutdown(sdCtx); err != nil {
+			slog.Error("otel shutdown failed", "error", err)
 		}
 	}()
 
-	// Set up slog with OpenTelemetry handler
-	jsonHandler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug})
-	logger := slog.New(jsonHandler)
-	otelLogger := slog.New(otel.NewOtelHandler(logger, config.ServiceName))
-	slog.SetDefault(otelLogger)
+	slog.SetDefault(slog.New(otel.NewLogHandler(cfg.ServiceName)))
 
-	// Test log to verify ingestion
-	slog.InfoContext(ctx, "Test log from main", "app", "example-service")
+	slog.InfoContext(ctx, "service started",
+		"service", cfg.ServiceName,
+		"env", cfg.Environment,
+	)
 
-	// Brief delay to allow batch processor to flush
-	time.Sleep(2 * time.Second)
-
-	// Initialize metrics recorder
-	metrics, err := otel.NewMetricsRecorder(otelClient.GetMeterProvider(), "example-service")
+	metrics, err := otel.NewMetricsRecorder(client.MeterProvider(), cfg.ServiceName, "test-component")
 	if err != nil {
-		slog.Error("Failed to create metrics recorder", "error", err)
+		slog.Error("failed to create metrics recorder", "error", err)
 		os.Exit(1)
 	}
 
-	// Create HTTP handler
 	mux := http.NewServeMux()
-	mux.HandleFunc("/hello", handleHello(otelClient, metrics))
+	mux.HandleFunc("/hello", handleHello(client, metrics))
+	mux.HandleFunc("/health", handleHealth())
 
-	// Start HTTP server
-	server := &http.Server{
-		Addr:    ":8080",
-		Handler: mux,
+	srv := &http.Server{
+		Addr:         ":8080",
+		Handler:      mux,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
 
 	go func() {
-		slog.Info("Starting HTTP server on :8080")
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			slog.Error("Server failed", "error", err)
+		slog.Info("listening", "addr", srv.Addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("server error", "error", err)
 			os.Exit(1)
 		}
 	}()
 
-	// Wait for shutdown signal
 	<-ctx.Done()
-	slog.Info("Shutting down server...")
+	slog.Info("shutdown signal received")
 
-	// Graceful shutdown
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer shutdownCancel()
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		slog.Error("Server shutdown failed", "error", err)
+	httpCtx, httpCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer httpCancel()
+	if err := srv.Shutdown(httpCtx); err != nil {
+		slog.Error("http shutdown failed", "error", err)
 	}
-	slog.Info("Server stopped")
 }
 
-func handleHello(otelClient *otel.Otel, metrics *otel.MetricsRecorder) http.HandlerFunc {
+func handleHello(client *otel.Client, metrics *otel.MetricsRecorder) http.HandlerFunc {
+	tracer := client.TracerProvider().Tracer("github.com/alipourhabibi/otel-client/examples")
+
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Start a new span
-		ctx, span := otel.StartSpan(r.Context(), otelClient.GetTracerProvider(), "handleHello")
+		ctx, span := tracer.Start(r.Context(), "handleHello",
+			oteltrace.WithSpanKind(oteltrace.SpanKindServer),
+			oteltrace.WithAttributes(
+				attribute.String("http.method", r.Method),
+				attribute.String("http.route", "/hello"),
+			),
+		)
 		defer span.End()
 
-		// Record latency
 		start := time.Now()
-		defer func() {
-			duration := time.Since(start)
-			metrics.RecordLatency(ctx, duration, attribute.String("endpoint", "/hello"))
-		}()
+		reqAttrs := []attribute.KeyValue{
+			attribute.String("endpoint", "/hello"),
+			attribute.String("method", r.Method),
+		}
+		defer func() { metrics.RecordLatency(ctx, time.Since(start), reqAttrs...) }()
 
-		// Log request
-		slog.InfoContext(ctx, "Processing request", "method", r.Method, "path", r.URL.Path)
+		slog.InfoContext(ctx, "handling request",
+			"method", r.Method,
+			"remote_addr", r.RemoteAddr,
+		)
 
-		// Simulate some work
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 
-		// Randomly fail 10% of the time
-		if time.Now().UnixNano()%99 == 0 {
-			err := errors.New("simulated request failure")
-			slog.ErrorContext(ctx, "Request failed", "error", err)
-			otel.RecordTraceError(err, "example-service", span)
-			metrics.RecordFailedRequest(ctx, attribute.String("endpoint", "/hello"))
-			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		// Simulate ~10 % error rate.
+		if time.Now().UnixNano()%10 == 0 {
+			err := errors.New("simulated failure")
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+
+			slog.ErrorContext(ctx, "request failed", "error", err)
+			metrics.RecordFailed(ctx, reqAttrs...)
+			http.Error(w, "internal server error", http.StatusInternalServerError)
 			return
 		}
 
-		// Record success
-		otel.RecordTraceSuccessful("example-service", span)
-		metrics.RecordAcceptedRequest(ctx, attribute.String("endpoint", "/hello"))
-		slog.InfoContext(ctx, "Request completed successfully")
+		span.SetStatus(codes.Ok, "")
+		metrics.RecordAccepted(ctx, reqAttrs...)
+		slog.InfoContext(ctx, "request succeeded")
 
-		// Respond
-		w.Write([]byte("Hello, World!"))
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Write([]byte("Hello, World!\n"))
 	}
+}
+
+func handleHealth() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"status":"ok"}`))
+	}
+}
+
+func getEnv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }

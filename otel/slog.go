@@ -12,114 +12,133 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-// otelHandler implements slog.Handler and emits logs to OTEL + slog output
-type otelHandler struct {
-	otelLogger log.Logger
-	logger     *slog.Logger
-	attrs      []slog.Attr
-	group      string
-}
-
-// NewOtelHandler creates a new handler
-func NewOtelHandler(l *slog.Logger, name string) slog.Handler {
-	return &otelHandler{
-		otelLogger: global.GetLoggerProvider().Logger(name),
-		logger:     l,
+func NewLogHandler(name string) slog.Handler {
+	return &Handler{
+		logger: global.GetLoggerProvider().Logger(name),
 	}
 }
 
-// Enabled always returns true
-func (h *otelHandler) Enabled(_ context.Context, level slog.Level) bool {
-	return true
+type Handler struct {
+	logger log.Logger
+	attrs  []slog.Attr
+	group  string
 }
 
-// Handle emits the log record to OTEL and slog output
-func (h *otelHandler) Handle(ctx context.Context, r slog.Record) error {
-	attrs := make([]log.KeyValue, 0, len(h.attrs)+r.NumAttrs()+4) // for trace_id and span_id
-	logAttrs := make([]any, 0, len(h.attrs)*2+r.NumAttrs()*2+4)
+func (h *Handler) Enabled(ctx context.Context, level slog.Level) bool {
+	return h.logger.Enabled(ctx, log.EnabledParameters{
+		Severity: slogToOtelSeverity(level),
+	})
+}
 
-	// handler-level attributes
+func (h *Handler) Handle(ctx context.Context, r slog.Record) error {
+	attrCap := len(h.attrs) + r.NumAttrs() + 3
+
+	attrs := make([]log.KeyValue, 0, attrCap)
+
+	appendAttr := func(k string, v slog.Value) {
+		switch v.Kind() {
+
+		case slog.KindString:
+			attrs = append(attrs, log.String(k, v.String()))
+
+		case slog.KindInt64:
+			attrs = append(attrs, log.Int64(k, v.Int64()))
+
+		case slog.KindFloat64:
+			attrs = append(attrs, log.Float64(k, v.Float64()))
+
+		case slog.KindBool:
+			attrs = append(attrs, log.Bool(k, v.Bool()))
+
+		case slog.KindDuration:
+			attrs = append(attrs, log.Int64(k, int64(v.Duration())))
+
+		case slog.KindTime:
+			attrs = append(attrs, log.String(k, v.Time().Format(time.RFC3339Nano)))
+
+		default:
+			attrs = append(attrs, log.String(k, v.String()))
+		}
+	}
+
 	for _, a := range h.attrs {
-		attrs = append(attrs, log.String(a.Key, a.Value.String()))
-		logAttrs = append(logAttrs, a.Key, a.Value.Any())
+		appendAttr(a.Key, a.Value)
 	}
 
-	// record-level attributes
 	r.Attrs(func(a slog.Attr) bool {
-		attrs = append(attrs, log.String(a.Key, a.Value.String()))
-		logAttrs = append(logAttrs, a.Key, a.Value.Any())
+		appendAttr(a.Key, a.Value)
 		return true
 	})
 
-	// group
 	if h.group != "" {
 		attrs = append(attrs, log.String("group", h.group))
-		logAttrs = append(logAttrs, "group", h.group)
 	}
 
-	// include span info if present
 	if span := trace.SpanFromContext(ctx); span.IsRecording() {
-		spanCtx := span.SpanContext()
+		sc := span.SpanContext()
+
 		attrs = append(attrs,
-			log.String("trace_id", spanCtx.TraceID().String()),
-			log.String("span_id", spanCtx.SpanID().String()),
+			log.String("trace_id", sc.TraceID().String()),
+			log.String("span_id", sc.SpanID().String()),
 		)
-		logAttrs = append(logAttrs, "trace_id", spanCtx.TraceID().String(), "span_id", spanCtx.SpanID().String())
 	}
 
-	// add source file:line
-	if pc, file, line, ok := runtime.Caller(3); ok {
-		_ = runtime.FuncForPC(pc)
-		source := file + ":" + strconv.Itoa(line)
-		attrs = append(attrs, log.String("source", source))
-		logAttrs = append(logAttrs, "source", source)
+	if r.PC != 0 {
+		frames := runtime.CallersFrames([]uintptr{r.PC})
+		f, _ := frames.Next()
+
+		attrs = append(attrs,
+			log.String("source", f.File+":"+strconv.Itoa(f.Line)),
+		)
 	}
 
-	// map slog.Level to OTEL severity
-	severity := log.SeverityInfo
-	switch r.Level {
-	case slog.LevelDebug:
-		severity = log.SeverityDebug
-	case slog.LevelWarn:
-		severity = log.SeverityWarn
-	case slog.LevelError:
-		severity = log.SeverityError
-	}
+	var rec log.Record
 
-	// build OTEL log record
-	logRecord := log.Record{}
-	logRecord.SetSeverity(severity)
-	logRecord.SetTimestamp(r.Time)
-	logRecord.SetObservedTimestamp(time.Now())
-	logRecord.SetBody(log.StringValue(r.Message))
-	logRecord.AddAttributes(attrs...)
-	logRecord.SetSeverityText(severity.String())
+	severity := slogToOtelSeverity(r.Level)
 
-	h.otelLogger.Emit(ctx, logRecord)
+	rec.SetSeverity(severity)
+	rec.SetSeverityText(severity.String())
+	rec.SetTimestamp(r.Time)
+	rec.SetObservedTimestamp(time.Now())
+	rec.SetBody(log.StringValue(r.Message))
 
-	// emit to terminal logger
-	h.logger.Log(ctx, r.Level, r.Message, logAttrs...)
+	rec.AddAttributes(attrs...)
+
+	h.logger.Emit(ctx, rec)
+
 	return nil
 }
 
-// WithAttrs returns a new handler with additional attributes
-func (h *otelHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	newAttrs := append([]slog.Attr(nil), h.attrs...)
-	newAttrs = append(newAttrs, attrs...)
-	return &otelHandler{
-		otelLogger: h.otelLogger,
-		logger:     h.logger,
-		attrs:      newAttrs,
-		group:      h.group,
+func (h *Handler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	merged := make([]slog.Attr, len(h.attrs)+len(attrs))
+
+	copy(merged, h.attrs)
+	copy(merged[len(h.attrs):], attrs)
+
+	return &Handler{
+		logger: h.logger,
+		attrs:  merged,
+		group:  h.group,
 	}
 }
 
-// WithGroup returns a new handler with group set
-func (h *otelHandler) WithGroup(name string) slog.Handler {
-	return &otelHandler{
-		otelLogger: h.otelLogger,
-		logger:     h.logger,
-		attrs:      h.attrs,
-		group:      name,
+func (h *Handler) WithGroup(name string) slog.Handler {
+	return &Handler{
+		logger: h.logger,
+		attrs:  h.attrs,
+		group:  name,
+	}
+}
+
+func slogToOtelSeverity(l slog.Level) log.Severity {
+	switch {
+	case l <= slog.LevelDebug:
+		return log.SeverityDebug
+	case l < slog.LevelWarn:
+		return log.SeverityInfo
+	case l < slog.LevelError:
+		return log.SeverityWarn
+	default:
+		return log.SeverityError
 	}
 }

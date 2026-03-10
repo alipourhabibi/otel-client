@@ -3,6 +3,7 @@ package otel
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -10,65 +11,106 @@ import (
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/log/global"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
+	"go.opentelemetry.io/otel/trace"
 )
 
-// Config holds configuration parameters for Otel initialization
+// Config holds all configuration needed to bootstrap the three OTel signals.
 type Config struct {
-	Host         string
-	Token        string
-	ServiceName  string
-	Environment  string
+	// Host is the OTLP gRPC endpoint without scheme, e.g. "localhost:4317".
+	Host string
+
+	// Token is sent as "Authorization: <Token>".
+	// If your Backend uses Bearer you should add it in Token
+	// Leave empty if your collector needs no auth.
+	Token string
+
+	// ServiceName is stamped on every trace, metric, and log record.
+	ServiceName string
+
+	// Environment is the deployment tier, e.g. "production", "staging".
+	Environment string
+
+	// Organization and StreamName are forwarded as custom OTLP headers.
+	// Remove these if your backend does not use them.
 	Organization string
 	StreamName   string
-	SampleRate   float64 // Sampling rate for traces (0 to 1; 0 disables sampling)
+
+	// SampleRate controls trace sampling:
+	//   0        → NeverSample  (disable tracing)
+	//   0 < r < 1 → ParentBased(TraceIDRatioBased(r))
+	//   >= 1     → AlwaysSample (100%, suitable for dev/staging)
+	SampleRate float64
 }
 
-// Otel encapsulates OpenTelemetry providers
-type Otel struct {
+// Validate returns a combined error for every invalid field.
+// Setup calls this automatically; you may also call it early during
+// flag/env parsing to surface problems before any network dials happen.
+func (c Config) Validate() error {
+	var errs []error
+	if c.Host == "" {
+		errs = append(errs, errors.New("otel: Host is required"))
+	}
+	if c.ServiceName == "" {
+		errs = append(errs, errors.New("otel: ServiceName is required"))
+	}
+	if c.SampleRate < 0 || c.SampleRate > 1 {
+		errs = append(errs, fmt.Errorf("otel: SampleRate %.2f is out of range [0, 1]", c.SampleRate))
+	}
+	return errors.Join(errs...)
+}
+
+// Client bootstraps and owns the three OTel SDK providers.
+// Create one per process; share it across the application.
+type Client struct {
 	config Config
-	logger *sdklog.LoggerProvider
+	log    *sdklog.LoggerProvider
 	meter  *sdkmetric.MeterProvider
 	tracer *sdktrace.TracerProvider
 }
 
-// New creates and initializes a new Otel instance with the provided configuration
-func New(config Config) *Otel {
-	return &Otel{
-		config: config,
-	}
+// New returns a Client. No network connections are made until Setup is called.
+func New(config Config) *Client {
+	return &Client{config: config}
 }
 
-// Setup initializes all OpenTelemetry providers
-func (o *Otel) Setup(ctx context.Context) error {
-	// Initialize logger provider
-	logger, err := o.initLoggerProvider(ctx)
-	if err != nil {
+// Setup validates config, builds a shared resource, initialises the log,
+// metric, and trace providers, then registers them as the global OTel providers.
+//
+// On success always pair with a deferred Shutdown - even on later errors —
+// to guarantee buffered telemetry is flushed before the process exits.
+func (c *Client) Setup(ctx context.Context) error {
+	if err := c.config.Validate(); err != nil {
 		return err
 	}
-	o.logger = logger
-	global.SetLoggerProvider(logger)
 
-	// Initialize meter provider
-	meter, err := o.initMeterProvider(ctx)
+	// Build the resource once. All three providers share the same instance so
+	// service metadata is identical across every signal in your backend.
+	res, err := c.buildResource(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("otel: build resource: %w", err)
 	}
-	o.meter = meter
-	otel.SetMeterProvider(meter)
 
-	// Initialize tracer provider
-	tracer, err := o.initTracerProvider(ctx)
-	if err != nil {
-		return err
+	if c.log, err = c.newLogProvider(ctx, res); err != nil {
+		return fmt.Errorf("otel: log provider: %w", err)
 	}
-	o.tracer = tracer
-	otel.SetTracerProvider(tracer)
+	global.SetLoggerProvider(c.log)
+
+	if c.meter, err = c.newMeterProvider(ctx, res); err != nil {
+		return fmt.Errorf("otel: meter provider: %w", err)
+	}
+	otel.SetMeterProvider(c.meter)
+
+	if c.tracer, err = c.newTracerProvider(ctx, res); err != nil {
+		return fmt.Errorf("otel: tracer provider: %w", err)
+	}
+	otel.SetTracerProvider(c.tracer)
 	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
 		propagation.TraceContext{},
 		propagation.Baggage{},
@@ -77,79 +119,70 @@ func (o *Otel) Setup(ctx context.Context) error {
 	return nil
 }
 
-// Shutdown gracefully shuts down all providers
-func (o *Otel) Shutdown(ctx context.Context) error {
+// Shutdown flushes all in-flight data and closes every provider.
+// Use a fresh context with a generous timeout (≥10 s) — do NOT reuse the
+// signal context, which is already cancelled by the time shutdown runs.
+func (c *Client) Shutdown(ctx context.Context) error {
 	var errs []error
-	if o.logger != nil {
-		if err := o.logger.Shutdown(ctx); err != nil {
-			errs = append(errs, err)
+	if c.log != nil {
+		if err := c.log.Shutdown(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("log: %w", err))
 		}
 	}
-	if o.meter != nil {
-		if err := o.meter.Shutdown(ctx); err != nil {
-			errs = append(errs, err)
+	if c.meter != nil {
+		if err := c.meter.Shutdown(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("meter: %w", err))
 		}
 	}
-	if o.tracer != nil {
-		if err := o.tracer.Shutdown(ctx); err != nil {
-			errs = append(errs, err)
+	if c.tracer != nil {
+		if err := c.tracer.Shutdown(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("tracer: %w", err))
 		}
 	}
 	return errors.Join(errs...)
 }
 
-// GetTracerProvider returns the tracer provider
-func (o *Otel) GetTracerProvider() *sdktrace.TracerProvider {
-	return o.tracer
+// TracerProvider returns the OTel TracerProvider interface.
+func (c *Client) TracerProvider() trace.TracerProvider {
+	return c.tracer
 }
 
-// GetMeterProvider returns the meter provider
-func (o *Otel) GetMeterProvider() *sdkmetric.MeterProvider {
-	return o.meter
+// MeterProvider returns the OTel MeterProvider interface.
+func (c *Client) MeterProvider() metric.MeterProvider {
+	return c.meter
 }
 
-// commonHeaders returns the common headers for OTLP exporters
-func (o *Otel) commonHeaders() map[string]string {
+func (c *Client) headers() map[string]string {
 	return map[string]string{
-		"Authorization": o.config.Token,
-		"organization":  o.config.Organization,
-		"stream-name":   o.config.StreamName,
+		"Authorization": c.config.Token,
+		"organization":  c.config.Organization,
+		"stream-name":   c.config.StreamName,
 	}
 }
 
-// commonResource creates a common resource configuration
-func (o *Otel) commonResource(ctx context.Context) (*resource.Resource, error) {
+func (c *Client) buildResource(ctx context.Context) (*resource.Resource, error) {
 	return resource.New(ctx,
 		resource.WithAttributes(
-			semconv.ServiceName(o.config.ServiceName),
-			semconv.DeploymentEnvironment(o.config.Environment),
+			semconv.ServiceName(c.config.ServiceName),
+			semconv.DeploymentEnvironment(c.config.Environment),
 		),
 		resource.WithProcessRuntimeDescription(),
 		resource.WithTelemetrySDK(),
 	)
 }
 
-// initLoggerProvider initializes the logger provider
-func (o *Otel) initLoggerProvider(ctx context.Context) (*sdklog.LoggerProvider, error) {
-	exporter, err := otlploggrpc.New(
-		ctx,
-		otlploggrpc.WithEndpoint(o.config.Host),
+func (c *Client) newLogProvider(ctx context.Context, res *resource.Resource) (*sdklog.LoggerProvider, error) {
+	exp, err := otlploggrpc.New(ctx,
+		otlploggrpc.WithEndpoint(c.config.Host),
 		otlploggrpc.WithInsecure(),
-		otlploggrpc.WithHeaders(o.commonHeaders()),
+		otlploggrpc.WithHeaders(c.headers()),
 	)
 	if err != nil {
 		return nil, err
 	}
-
-	res, err := o.commonResource(ctx)
-	if err != nil {
-		return nil, err
-	}
-
 	return sdklog.NewLoggerProvider(
 		sdklog.WithResource(res),
-		sdklog.WithProcessor(sdklog.NewBatchProcessor(
-			exporter,
+		sdklog.WithProcessor(sdklog.NewBatchProcessor(exp,
 			sdklog.WithExportInterval(1*time.Second),
 			sdklog.WithExportTimeout(5*time.Second),
 			sdklog.WithMaxQueueSize(2048),
@@ -157,18 +190,11 @@ func (o *Otel) initLoggerProvider(ctx context.Context) (*sdklog.LoggerProvider, 
 	), nil
 }
 
-// initMeterProvider initializes the meter provider
-func (o *Otel) initMeterProvider(ctx context.Context) (*sdkmetric.MeterProvider, error) {
-	res, err := o.commonResource(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	exporter, err := otlpmetricgrpc.New(
-		ctx,
-		otlpmetricgrpc.WithEndpoint(o.config.Host),
+func (c *Client) newMeterProvider(ctx context.Context, res *resource.Resource) (*sdkmetric.MeterProvider, error) {
+	exp, err := otlpmetricgrpc.New(ctx,
+		otlpmetricgrpc.WithEndpoint(c.config.Host),
 		otlpmetricgrpc.WithInsecure(),
-		otlpmetricgrpc.WithHeaders(o.commonHeaders()),
+		otlpmetricgrpc.WithHeaders(c.headers()),
 		otlpmetricgrpc.WithTimeout(5*time.Second),
 		otlpmetricgrpc.WithRetry(otlpmetricgrpc.RetryConfig{
 			Enabled:         true,
@@ -180,31 +206,20 @@ func (o *Otel) initMeterProvider(ctx context.Context) (*sdkmetric.MeterProvider,
 	if err != nil {
 		return nil, err
 	}
-
-	reader := sdkmetric.NewPeriodicReader(
-		exporter,
-		sdkmetric.WithInterval(10*time.Second),
-		sdkmetric.WithTimeout(5*time.Second),
-	)
-
 	return sdkmetric.NewMeterProvider(
 		sdkmetric.WithResource(res),
-		sdkmetric.WithReader(reader),
+		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(exp,
+			sdkmetric.WithInterval(10*time.Second),
+			sdkmetric.WithTimeout(5*time.Second),
+		)),
 	), nil
 }
 
-// initTracerProvider initializes the tracer provider
-func (o *Otel) initTracerProvider(ctx context.Context) (*sdktrace.TracerProvider, error) {
-	res, err := o.commonResource(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	exporter, err := otlptracegrpc.New(
-		ctx,
-		otlptracegrpc.WithEndpoint(o.config.Host),
+func (c *Client) newTracerProvider(ctx context.Context, res *resource.Resource) (*sdktrace.TracerProvider, error) {
+	exp, err := otlptracegrpc.New(ctx,
+		otlptracegrpc.WithEndpoint(c.config.Host),
 		otlptracegrpc.WithInsecure(),
-		otlptracegrpc.WithHeaders(o.commonHeaders()),
+		otlptracegrpc.WithHeaders(c.headers()),
 		otlptracegrpc.WithTimeout(5*time.Second),
 		otlptracegrpc.WithRetry(otlptracegrpc.RetryConfig{
 			Enabled:         true,
@@ -217,13 +232,18 @@ func (o *Otel) initTracerProvider(ctx context.Context) (*sdktrace.TracerProvider
 		return nil, err
 	}
 
-	sampler := sdktrace.AlwaysSample()
-	if o.config.SampleRate > 0 {
-		sampler = sdktrace.ParentBased(sdktrace.TraceIDRatioBased(o.config.SampleRate))
+	var sampler sdktrace.Sampler
+	switch {
+	case c.config.SampleRate <= 0:
+		sampler = sdktrace.NeverSample()
+	case c.config.SampleRate >= 1:
+		sampler = sdktrace.AlwaysSample()
+	default:
+		sampler = sdktrace.ParentBased(sdktrace.TraceIDRatioBased(c.config.SampleRate))
 	}
 
 	return sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(exporter),
+		sdktrace.WithBatcher(exp),
 		sdktrace.WithResource(res),
 		sdktrace.WithSampler(sampler),
 	), nil
